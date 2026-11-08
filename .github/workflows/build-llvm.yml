@@ -1,0 +1,144 @@
+name: build-llvm
+
+# Xuansi LLVM dev-package builder (B11 infra): build the pinned
+# espressif LLVM — the SAME recipe as wan-cloud/xuansi-drivers
+# tools/build-wamrc.sh phase_llvm — and publish the consumable subset
+# wamr-compiler links against (llvm-config, libLLVM*.a, cmake config,
+# headers) as a RELOCATABLE install tree.
+#
+# Purpose: future Xtensa-backend patches live as commits on
+# xuansi/* branches here; a dispatch turns a patch into a downloadable
+# LLVM dev package in ~50 min, no local 40-min rebuild per change.
+#
+# Triggers: manual dispatch (input ref, default xuansi/base-18.1.2),
+# or pushing a tag llvm-x* (builds the tagged commit).
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "git ref to build (branch, tag or SHA)"
+        required: true
+        default: "xuansi/base-18.1.2"
+  push:
+    tags:
+      - "llvm-x*"
+
+permissions:
+  contents: write   # release create/upload
+
+env:
+  RELEASE_TAG: llvm-dev-v1
+  BUILD_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: checkout the requested ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BUILD_REF }}
+          fetch-depth: 1
+
+      - name: source sha + asset name
+        id: src
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "ref8=${sha:0:8}" >> "$GITHUB_OUTPUT"
+          echo "asset=llvm-xtensa-dev-${sha:0:8}-linux-x64.tar.zst" >> "$GITHUB_OUTPUT"
+          echo "manifest=llvm-dev-manifest-${sha:0:8}.json" >> "$GITHUB_OUTPUT"
+
+      # The ~50-minute part. A re-dispatch (or a run after a later
+      # step failed) restores the tree instead of repaying. Same
+      # pattern as xuansi-drivers toolchain.yml.
+      - name: restore the LLVM build tree (keyed on the source sha)
+        id: llvm-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: llvm/build
+          key: llvm-build-${{ steps.src.outputs.sha }}
+
+      - name: deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build ccache zstd
+
+      # Configure flags are EXACTLY tools/build-wamrc.sh phase_llvm
+      # (Xtensa is an EXPERIMENTAL target in the espressif fork;
+      # -include cstdint for GCC15/libstdc++ drift). Only additions:
+      # CMAKE_INSTALL_PREFIX for the relocatable package tree.
+      - name: configure + build LLVM (only on cache miss)
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          cmake -G Ninja -S llvm -B llvm/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/llvm-pkg" \
+            -DLLVM_TARGETS_TO_BUILD="AArch64;ARM;Mips;RISCV;X86" \
+            -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=Xtensa \
+            -DCMAKE_CXX_FLAGS="-include cstdint" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          ninja -C llvm/build
+
+      - name: save the LLVM build tree
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: llvm/build
+          key: llvm-build-${{ steps.src.outputs.sha }}
+
+      # Install tree (not the raw build tree): its lib/cmake/llvm is
+      # relocatable, so consumers extract anywhere and point
+      # -DLLVM_DIR=<pkg>/lib/cmake/llvm at it.
+      - name: install LLVM into the package tree
+        run: |
+          set -eux
+          test -f llvm/build/build.ninja   # cache-hit runs skip straight here
+          ninja -C llvm/build install
+          test -x llvm-pkg/bin/llvm-config
+          test -d llvm-pkg/lib/cmake/llvm
+          ls llvm-pkg/lib/libLLVM*.a >/dev/null
+
+      - name: package the consumable subset + manifest
+        run: |
+          set -eux
+          llvm_version="$(llvm-pkg/bin/llvm-config --version)"
+          asset="dist/${{ steps.src.outputs.asset }}"
+          mkdir -p dist
+          # what wamr-compiler needs: cmake exports, static libs,
+          # headers, llvm-config. Nothing else ships.
+          ( cd llvm-pkg && tar --zstd -cf "../$asset" \
+              bin/llvm-config* lib/libLLVM*.a lib/cmake/llvm \
+              include/llvm include/llvm-c )
+          asset_sha="$(sha256sum "$asset" | cut -d' ' -f1)"
+          asset_size="$(stat -c%s "$asset")"
+          libs_bytes="$(du -cb llvm-pkg/lib/libLLVM*.a | tail -1 | cut -f1)"
+          runner_image="$(. /etc/os-release && echo "$PRETTY_NAME")"
+          cat > "dist/${{ steps.src.outputs.manifest }}" <<EOF
+          {
+            "name": "${{ steps.src.outputs.asset }}",
+            "source_sha": "${{ steps.src.outputs.sha }}",
+            "esp_llvm_sha": "${{ steps.src.outputs.sha }}",
+            "built_from_ref": "$BUILD_REF",
+            "llvm_version": "$llvm_version",
+            "asset_sha256": "$asset_sha",
+            "asset_size_bytes": "$asset_size",
+            "libllvm_bytes": "$libs_bytes",
+            "configure_flags": "-DCMAKE_BUILD_TYPE=Release -DLLVM_TARGETS_TO_BUILD=AArch64;ARM;Mips;RISCV;X86 -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=Xtensa -DCMAKE_CXX_FLAGS=-include cstdint -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
+            "built": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "runner_os": "$RUNNER_OS",
+            "runner_image": "$runner_image"
+          }
+          EOF
+          cat "dist/${{ steps.src.outputs.manifest }}"
+
+      - name: attach to the llvm-dev-v1 release (create if absent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            || gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                 --title "llvm-dev-v1: consumable espressif LLVM (Xtensa experimental) dev packages" \
+                 --notes "Built by build-llvm.yml from the ref named in each manifest (recipe identical to wan-cloud/xuansi-drivers tools/build-wamrc.sh). Assets: llvm-xtensa-dev-<sha8>-linux-x64.tar.zst — relocatable install tree; point -DLLVM_DIR=<pkg>/lib/cmake/llvm at it."
+          gh release upload "$RELEASE_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
