@@ -29,9 +29,11 @@ name: build-llvm
 # or pushing a tag llvm-x* (builds the tagged commit).
 #
 # Matrix (B11 toolchain P1): one leg per plat — linux-x64 on
-# ubuntu-latest, macos-x64 on macos-15-intel, macos-arm64 on macos-14.
-# (macos-13 was the planned Intel label but GitHub retired it; the
-# current Intel runner label is macos-15-intel — same x86_64 arch.)
+# ubuntu-latest, macos-x64 on macos-15-intel, macos-arm64 on
+# macos-15. (The plan named macos-13/macos-14, but GitHub retired
+# both pools by 2026: macos-13 is an unknown label and the
+# macos-14 arm64 config is "not supported" per the job annotation
+# of run 42486462620. macos-15/intel = current supported pair.)
 # All legs publish to the SAME release tag; the release-create step
 # is race-tolerant because the legs run concurrently. OS-flavor
 # differences (deps, tar/stat/sha) branch on RUNNER_OS inside the
@@ -72,7 +74,7 @@ jobs:
             plat: linux-x64
           - os: macos-15-intel
             plat: macos-x64
-          - os: macos-14
+          - os: macos-15
             plat: macos-arm64
     steps:
       - name: checkout the requested ref
