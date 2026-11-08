@@ -27,6 +27,18 @@ name: build-llvm
 #
 # Triggers: manual dispatch (input ref, default xuansi/base-18.1.2),
 # or pushing a tag llvm-x* (builds the tagged commit).
+#
+# Matrix (B11 toolchain P1): one leg per plat — linux-x64 on
+# ubuntu-latest, macos-x64 on macos-15-intel, macos-arm64 on macos-14.
+# (macos-13 was the planned Intel label but GitHub retired it; the
+# current Intel runner label is macos-15-intel — same x86_64 arch.)
+# All legs publish to the SAME release tag; the release-create step
+# is race-tolerant because the legs run concurrently. OS-flavor
+# differences (deps, tar/stat/sha) branch on RUNNER_OS inside the
+# steps; the configure/build recipe itself is identical (clang on
+# macOS keeps -include cstdint, same semantics).
+# build-windows below is a SEPARATE best-effort probe leg (MSVC,
+# continue-on-error): its failure must not mask the matrix legs.
 on:
   workflow_dispatch:
     inputs:
@@ -47,8 +59,21 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: build (${{ matrix.plat }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 150
+    strategy:
+      # each plat publishes its own asset; one leg failing must not
+      # cancel its siblings
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            plat: linux-x64
+          - os: macos-15-intel
+            plat: macos-x64
+          - os: macos-14
+            plat: macos-arm64
     steps:
       - name: checkout the requested ref
         uses: actions/checkout@v4
@@ -62,22 +87,30 @@ jobs:
           sha="$(git rev-parse HEAD)"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "ref8=${sha:0:8}" >> "$GITHUB_OUTPUT"
-          echo "asset=llvm-xtensa-dev-${sha:0:8}-linux-x64.tar.zst" >> "$GITHUB_OUTPUT"
-          echo "manifest=llvm-dev-manifest-${sha:0:8}.json" >> "$GITHUB_OUTPUT"
+          echo "asset=llvm-xtensa-dev-${sha:0:8}-${{ matrix.plat }}.tar.zst" >> "$GITHUB_OUTPUT"
+          echo "manifest=llvm-dev-manifest-${sha:0:8}-${{ matrix.plat }}.json" >> "$GITHUB_OUTPUT"
 
       # The ~35-minute part. A re-dispatch (or a run after a later
       # step failed) restores the tree instead of repaying. Key carries
-      # the configure identity (-notools): trees configured with tools
-      # ON must not be reused.
+      # the configure identity (-notools) AND the plat suffix: build
+      # trees are NOT portable across runner OSes.
       - name: restore the LLVM build tree (keyed on the source sha)
         id: llvm-cache
         uses: actions/cache/restore@v4
         with:
           path: llvm/build
-          key: llvm-build-${{ steps.src.outputs.sha }}-notools
+          key: llvm-build-${{ steps.src.outputs.sha }}-notools-${{ matrix.plat }}
 
-      - name: deps
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build ccache zstd
+      - name: deps (apt on linux, brew on macos)
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build ccache zstd
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            brew install ninja ccache zstd
+          else
+            echo "unexpected RUNNER_OS=$RUNNER_OS" >&2
+            exit 2
+          fi
 
       - name: configure + build LLVM (only on cache miss)
         if: steps.llvm-cache.outputs.cache-hit != 'true'
@@ -105,7 +138,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: llvm/build
-          key: llvm-build-${{ steps.src.outputs.sha }}-notools
+          key: llvm-build-${{ steps.src.outputs.sha }}-notools-${{ matrix.plat }}
 
       # Install tree (not the raw build tree): its lib/cmake/llvm is
       # relocatable, so consumers extract anywhere and point
@@ -128,9 +161,18 @@ jobs:
           mkdir -p dist
           # what wamr-compiler needs: cmake exports, static libs,
           # headers, llvm-config, llvm-tblgen. Nothing else ships.
-          ( cd llvm-pkg && tar --zstd -cf "../$asset" \
-              bin/llvm-config* bin/llvm-tblgen lib/libLLVM*.a \
-              lib/cmake/llvm include/llvm include/llvm-c )
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            ( cd llvm-pkg && tar --zstd -cf "../$asset" \
+                bin/llvm-config* bin/llvm-tblgen lib/libLLVM*.a \
+                lib/cmake/llvm include/llvm include/llvm-c )
+          else
+            # macOS: stream /usr/bin/tar (bsdtar; explicit path so a
+            # brew-shadowed GNU tar cannot change semantics) into the
+            # brew zstd. Same .tar.zst output as the linux legs.
+            ( cd llvm-pkg && /usr/bin/tar -cf - \
+                bin/llvm-config* bin/llvm-tblgen lib/libLLVM*.a \
+                lib/cmake/llvm include/llvm include/llvm-c ) | zstd -q -o "$asset"
+          fi
 
           # Completeness gate: every ${_IMPORT_PREFIX}/... file the
           # cmake exports reference must be inside the package (this
@@ -149,10 +191,24 @@ jobs:
           print(f"exports completeness: OK ({len(refs)} referenced files present)")
           EOF
 
-          asset_sha="$(sha256sum "$asset" | cut -d' ' -f1)"
-          asset_size="$(stat -c%s "$asset")"
-          libs_bytes="$(du -cb llvm-pkg/lib/libLLVM*.a | tail -1 | cut -f1)"
-          runner_image="$(. /etc/os-release && echo "$PRETTY_NAME")"
+          case "$(uname -s)" in
+            Linux)
+              asset_sha="$(sha256sum "$asset" | cut -d' ' -f1)"
+              asset_size="$(stat -c%s "$asset")"
+              libs_bytes="$(du -cb llvm-pkg/lib/libLLVM*.a | tail -1 | cut -f1)"
+              runner_image="$(. /etc/os-release && echo "$PRETTY_NAME")"
+              ;;
+            Darwin)
+              asset_sha="$(shasum -a 256 "$asset" | cut -d' ' -f1)"
+              asset_size="$(/usr/bin/stat -f%z "$asset")"
+              libs_bytes="$(/usr/bin/stat -f%z llvm-pkg/lib/libLLVM*.a | awk '{s+=$1} END {print s}')"
+              runner_image="$(sw_vers -productName) $(sw_vers -productVersion)"
+              ;;
+            *)
+              echo "unexpected uname: $(uname -s)" >&2
+              exit 2
+              ;;
+          esac
           cat > "dist/${{ steps.src.outputs.manifest }}" <<EOF
           {
             "name": "${{ steps.src.outputs.asset }}",
@@ -177,8 +233,162 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eux
+          # All legs (matrix + windows probe) upload to the SAME
+          # release concurrently: view first; if absent, create; if
+          # create loses the race to a sibling that created it in the
+          # meantime, that is SUCCESS for this leg, not failure —
+          # hence the trailing "|| true" (upload below still verifies
+          # the release exists).
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             || gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
                  --title "llvm-dev-v1: consumable espressif LLVM (Xtensa experimental) dev packages" \
-                 --notes "Built by build-llvm.yml from the ref named in each manifest (recipe of wan-cloud/xuansi-drivers tools/build-wamrc.sh; libraries-only install tree — see manifest recipe_delta). Assets: llvm-xtensa-dev-<sha8>-linux-x64.tar.zst — relocatable; point -DLLVM_DIR=<pkg>/lib/cmake/llvm at it."
+                 --notes "Built by build-llvm.yml from the ref named in each manifest (recipe of wan-cloud/xuansi-drivers tools/build-wamrc.sh; libraries-only install tree — see manifest recipe_delta). Assets: llvm-xtensa-dev-<sha8>-linux-x64.tar.zst — relocatable; point -DLLVM_DIR=<pkg>/lib/cmake/llvm at it." \
+            || true
+          gh release upload "$RELEASE_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+
+  # ------------------------------------------------------------------
+  # BEST-EFFORT PROBE LEG (B11 toolchain P1): same package built with
+  # MSVC on windows-latest. This is evidence-gathering, NOT a
+  # supported platform yet — continue-on-error keeps its outcome from
+  # masking the matrix legs. Deltas vs the unix job:
+  #   - cl.exe env via ilammy/msvc-dev-cmd (no -include cstdint —
+  #     MSVC header story differs; no ccache launcher)
+  #   - ninja + zstd via chocolatey (zstd ships as .tar.zst like the
+  #     other legs: tar streams into the zstd CLI — no reliance on
+  #     bsdtar/GNU-tar zstd support, which varies by Windows image)
+  #   - MSVC static libs are LLVM*.lib (possibly lib/Release/), so
+  #     packaging globs are find-based
+  #   - no build-tree cache (probe leg; it rebuilds each dispatch)
+  # If this leg fails, record the log tail and move on — do not let
+  # it block the matrix legs' green.
+  build-windows:
+    name: build (win-x64, best-effort)
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: checkout the requested ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BUILD_REF }}
+          fetch-depth: 1
+
+      - name: source sha + asset name
+        id: src
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "ref8=${sha:0:8}" >> "$GITHUB_OUTPUT"
+          echo "asset=llvm-xtensa-dev-${sha:0:8}-win-x64.tar.zst" >> "$GITHUB_OUTPUT"
+          echo "manifest=llvm-dev-manifest-${sha:0:8}-win-x64.json" >> "$GITHUB_OUTPUT"
+
+      # cl.exe + INCLUDE/LIB env for every later bash step
+      - name: set up MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: deps (ninja + zstd via chocolatey)
+        shell: pwsh
+        run: choco install --no-progress -y ninja zstandard
+
+      - name: configure + build LLVM
+        run: |
+          set -eux
+          # cygpath -m: native cmake.exe needs a Windows path, not the
+          # MSYS path $PWD would expand to in git-bash
+          install_prefix="$(cygpath -m "$PWD")/llvm-pkg"
+          cmake -G Ninja -S llvm -B llvm/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$install_prefix" \
+            -DLLVM_TARGETS_TO_BUILD="AArch64;ARM;Mips;RISCV;X86" \
+            -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=Xtensa \
+            -DLLVM_BUILD_TOOLS=OFF \
+            -DLLVM_TOOL_LTO_BUILD=OFF \
+            -DLLVM_TOOL_REMARKS_SHLIB_BUILD=OFF
+          ninja -C llvm/build
+
+      - name: build llvm-config (tool; cheap)
+        run: ninja -C llvm/build llvm-config
+
+      - name: install LLVM into the package tree
+        run: |
+          set -eux
+          test -f llvm/build/build.ninja
+          ninja -C llvm/build install
+          test -d llvm-pkg/lib/cmake/llvm
+          ls llvm-pkg/lib/LLVM*.lib llvm-pkg/lib/Release/LLVM*.lib llvm-pkg/lib/libLLVM*.a >/dev/null 2>&1 || {
+            echo "no MSVC static libs found in llvm-pkg/lib" >&2; ls -R llvm-pkg/lib | head -50; exit 1; }
+          ls llvm-pkg/bin/llvm-tblgen* >/dev/null
+          cp llvm/build/bin/llvm-config* llvm-pkg/bin/
+
+      - name: package the consumable subset + manifest
+        run: |
+          set -eux
+          cfg_bin="$(compgen -G 'llvm-pkg/bin/llvm-config*' | head -1)"
+          llvm_version="$("$cfg_bin" --version)"
+          asset="dist/${{ steps.src.outputs.asset }}"
+          mkdir -p dist
+          # MSVC libs are LLVM*.lib (possibly under lib/Release/);
+          # find | tar -T - survives whichever subdir layout MSVC
+          # produced, where a fixed glob would fail the tar step.
+          ( cd llvm-pkg && find bin lib include -type f \
+              \( -name 'llvm-config*' -o -name 'llvm-tblgen*' \
+                 -o -name 'LLVM*.lib' -o -name 'libLLVM*.a' \
+                 -o -path 'lib/cmake/llvm/*' \
+                 -o -path 'include/llvm/*' -o -path 'include/llvm-c/*' \) \
+              | tar -cf - -T - ) | zstd -q -o "$asset"
+
+          # Completeness gate: every ${_IMPORT_PREFIX}/... file the
+          # cmake exports reference must be inside the package.
+          python - <<'EOF'
+          import re, sys
+          from pathlib import Path
+          prefix = Path("llvm-pkg")
+          refs = set()
+          for f in (prefix / "lib/cmake/llvm").glob("LLVMExports*.cmake"):
+              refs |= set(re.findall(r'\$\{_IMPORT_PREFIX\}/(\S+?)(?=["\s])', f.read_text()))
+          missing = sorted(r for r in refs if not (prefix / r).exists())
+          if missing:
+              sys.exit(f"exports reference files missing from the package: {missing}")
+          print(f"exports completeness: OK ({len(refs)} referenced files present)")
+          EOF
+
+          asset_sha="$(python -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$asset")"
+          asset_size="$(python -c "import os,sys; print(os.path.getsize(sys.argv[1]))" "$asset")"
+          libs_bytes="$(python -c "import glob,os; paths=glob.glob('llvm-pkg/lib/LLVM*.lib')+glob.glob('llvm-pkg/lib/Release/LLVM*.lib')+glob.glob('llvm-pkg/lib/libLLVM*.a'); print(sum(os.path.getsize(p) for p in paths))")"
+          cat > "dist/${{ steps.src.outputs.manifest }}" <<EOF
+          {
+            "name": "${{ steps.src.outputs.asset }}",
+            "source_sha": "${{ steps.src.outputs.sha }}",
+            "esp_llvm_sha": "${{ steps.src.outputs.sha }}",
+            "built_from_ref": "$BUILD_REF",
+            "llvm_version": "$llvm_version",
+            "asset_sha256": "$asset_sha",
+            "asset_size_bytes": "$asset_size",
+            "libllvm_bytes": "$libs_bytes",
+            "configure_flags": "-DCMAKE_BUILD_TYPE=Release -DLLVM_TARGETS_TO_BUILD=AArch64;ARM;Mips;RISCV;X86 -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=Xtensa -DLLVM_BUILD_TOOLS=OFF -DLLVM_TOOL_LTO_BUILD=OFF -DLLVM_TOOL_REMARKS_SHLIB_BUILD=OFF (MSVC: no -include cstdint, no ccache launcher)",
+            "recipe_delta_vs_wamrc": "as the unix legs + MSVC toolchain; best-effort probe leg (continue-on-error)",
+            "built": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "runner_os": "$RUNNER_OS",
+            "runner_image": "windows-latest (MSVC, best-effort probe)"
+          }
+          EOF
+          cat "dist/${{ steps.src.outputs.manifest }}"
+
+      - name: attach to the llvm-dev-v1 release (create if absent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          # same race-tolerant pattern as the matrix legs: create
+          # failure because a sibling already created it = success
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            || gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                 --title "llvm-dev-v1: consumable espressif LLVM (Xtensa experimental) dev packages" \
+                 --notes "Built by build-llvm.yml from the ref named in each manifest (recipe of wan-cloud/xuansi-drivers tools/build-wamrc.sh; libraries-only install tree — see manifest recipe_delta). Assets: llvm-xtensa-dev-<sha8>-linux-x64.tar.zst — relocatable; point -DLLVM_DIR=<pkg>/lib/cmake/llvm at it." \
+            || true
           gh release upload "$RELEASE_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
