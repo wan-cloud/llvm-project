@@ -1,0 +1,141 @@
+name: probe-22-wamrc
+
+# B11 probe-22 (independent track, master ruling 2026-11-08): build
+# WAMR main's wamr-compiler against the esp-llvm 22 dev package
+# (release/esp_22.x tip ae2236e9, built by build-llvm.yml) and compile
+# hello.wasm -> hello-22.aot with the drivers build.sh flags.
+#
+# Record-only probe: does NOT touch any 18.1.2 pipeline (drivers
+# toolchain.yml / ci.yml, xuansi-fw). Artifacts are probes, not
+# deliverables. The board runtime is WAMR 2.4.0 (AOT version 4);
+# wamrc from main emits AOT version 6 — the .aot is expected NOT to
+# load there; this run only proves the toolchain compiles and the
+# artifact can be produced.
+
+on:
+  workflow_dispatch:
+    inputs:
+      llvm_sha:
+        description: "esp-llvm source sha the dev package was built from"
+        required: true
+        default: "ae2236e996def0ffe0570ab83de986016052da3d"
+      wamr_sha:
+        description: "WAMR commit to build wamr-compiler from"
+        required: true
+        default: "ffc22889948b1f063d7258d34d4e636ee0914925"
+
+permissions:
+  contents: read
+
+jobs:
+  wamrc22:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build zstd
+
+      - name: fetch the llvm-dev-22 package + manifest (two-way pin)
+        env:
+          LLVM_SHA: ${{ inputs.llvm_sha }}
+        run: |
+          s8="${LLVM_SHA:0:8}"
+          base="https://github.com/wan-cloud/llvm-project/releases/download/llvm-dev-v1"
+          curl -fsSL "$base/llvm-xtensa-dev-$s8-linux-x64.tar.zst" -o llvm-dev.tar.zst
+          curl -fsSL "$base/llvm-dev-manifest-$s8.json" -o llvm-dev-manifest.json
+          python3 - llvm-dev.tar.zst "$LLVM_SHA" <<'EOF'
+          import hashlib, json, sys
+          data = open(sys.argv[1], 'rb').read()
+          m = json.load(open('llvm-dev-manifest.json'))
+          got = hashlib.sha256(data).hexdigest()
+          checks = {
+              'tarball sha256 == manifest.asset_sha256': got == m.get('asset_sha256'),
+              'manifest.esp_llvm_sha == dispatch pin': m.get('esp_llvm_sha') == sys.argv[2],
+          }
+          for k, v in checks.items():
+              print(('PASS ' if v else 'FAIL ') + k)
+              if not v:
+                  sys.exit(1)
+          print('llvm version:', m.get('llvm_version'))
+          EOF
+          mkdir -p llvm-dev && tar --zstd -xf llvm-dev.tar.zst -C llvm-dev
+          test -d llvm-dev/lib/cmake/llvm
+
+      - name: fetch WAMR (main)
+        env:
+          WAMR_SHA: ${{ inputs.wamr_sha }}
+        run: |
+          git init -q wamr
+          git -C wamr remote add origin https://github.com/bytecodealliance/wasm-micro-runtime.git
+          git -C wamr fetch --depth 1 origin "$WAMR_SHA"
+          git -C wamr checkout FETCH_HEAD
+          git -C wamr log -1 --format='WAMR at %H %ci %s'
+
+      - name: build wamr-compiler (CUSTOM_LLVM, minutes)
+        run: |
+          cmake -G Ninja -S wamr/wamr-compiler -B wamr/wamr-compiler/build \
+            -DCMAKE_BUILD_TYPE= \
+            -DCMAKE_CXX_FLAGS="-include cstdint" \
+            -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 \
+            -DLLVM_DIR="$GITHUB_WORKSPACE/llvm-dev/lib/cmake/llvm"
+          ninja -C wamr/wamr-compiler/build
+          cp wamr/wamr-compiler/build/wamrc wamrc-22
+          ls -la wamrc-22
+
+      - name: assert the xtensa backend + version
+        run: |
+          ./wamrc-22 --version
+          targets="$(./wamrc-22 --target=help 2>&1 || true)"
+          echo "$targets"
+          echo "$targets" | grep -q "xtensa" || { echo "wamrc-22 lacks the xtensa backend" >&2; exit 1; }
+          echo "xtensa backend: OK"
+
+      - name: hello.wasm -> hello-22.aot (same flags as drivers build.sh)
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/wan-cloud/xuansi-drivers/main/modules/hello/1.0.0/hello.wasm" -o hello.wasm
+          echo "f8befc84ae31bab08308cf3ccfed8be0d42667a4f9b1953fba9612c8d61c1d4c  hello.wasm" | sha256sum -c -
+          ./wamrc-22 --target=xtensa --cpu=esp32s3 --size-level=3 -o hello-22.aot hello.wasm
+          sha256sum wamrc-22 hello-22.aot hello.wasm
+
+      - name: AOT container dump (header + section table)
+        run: |
+          python3 - <<'EOF'
+          import struct
+          NAMES = {0: "TARGET_INFO", 1: "INIT_DATA", 2: "TEXT", 3: "FUNCTION",
+                   4: "EXPORT", 5: "RELOCATION", 6: "SIGNATURE", 100: "CUSTOM"}
+          b = open('hello-22.aot', 'rb').read()
+          assert b[0:4] == b"\0aot", "bad magic"
+          version, = struct.unpack_from("<I", b, 4)
+          print(f"hello-22.aot: {len(b)} bytes, magic \\0aot, version {version}")
+          off, secs = 8, []
+          while off + 8 <= len(b):
+              off = (off + 3) & ~3
+              if off + 8 > len(b):
+                  break
+              stype, size = struct.unpack_from("<II", b, off)
+              off += 8
+              body = b[off:off + size]
+              secs.append((stype, size))
+              extra = ""
+              if stype == 2 and len(body) >= 4:
+                  lit, = struct.unpack_from("<I", body, 0)
+                  extra = f"  literal_size={lit} code={size-4-lit}"
+              if stype == 0:
+                  bt, abi, et, em = struct.unpack_from("<HHHH", body, 0)
+                  arch = body[32:48].split(b"\0")[0].decode(errors="replace")
+                  extra = f"  bin={bt} abi={abi} e_type={et} e_machine={em} arch={arch!r}"
+              print(f"  [{NAMES.get(stype, str(stype)):>12}] size={size}{extra}")
+              off += size
+          print(f"sections: {len(secs)}")
+          EOF
+
+      - name: upload probe artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe22-wamrc
+          path: |
+            wamrc-22
+            hello-22.aot
+            hello.wasm
+            llvm-dev-manifest.json
+          if-no-files-found: error
