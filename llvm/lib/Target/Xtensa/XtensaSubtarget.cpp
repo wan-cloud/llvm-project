@@ -27,6 +27,14 @@ using namespace llvm;
 static cl::opt<bool> TextSectionLiterals("mtext-section-literals",
                                          cl::init(false), cl::Hidden);
 
+// xuansi A3 surgery: address the separate literal pool through a base
+// register (l32i base+offset) instead of l32r, so that no executable
+// window is needed to read constants.  Defaults on for this fork; pass
+// -mllvm -xuansi-literal-base=0 to get the stock l32r codegen back
+// (A/B comparisons in one toolchain).
+static cl::opt<bool> LiteralPoolBase("xuansi-literal-base",
+                                     cl::init(true), cl::Hidden);
+
 bool XtensaSubtarget::useTextSectionLiterals() const
 {
   // If code model is large then always place literals in
@@ -36,6 +44,11 @@ bool XtensaSubtarget::useTextSectionLiterals() const
 
   return TextSectionLiterals;
 }
+
+bool XtensaSubtarget::useLiteralPoolBase() const {
+  return LiteralPoolBase && !useTextSectionLiterals();
+}
+
 
 XtensaSubtarget &
 XtensaSubtarget::initializeSubtargetDependencies(StringRef CPU, StringRef FS) {

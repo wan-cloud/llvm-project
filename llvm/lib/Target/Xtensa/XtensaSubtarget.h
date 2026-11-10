@@ -161,6 +161,35 @@ public:
 
   bool isWinABI() const { return hasWindowed(); }
 
+  // ---------------------------------------------------------------------
+  // xuansi A3 surgery: constant addressing through a literal base register.
+  //
+  // Every function whose code references the literal pool loads the pool
+  // base with the fixed chain
+  //
+  //   l32i  base, a2, XUANSI_EXEC_ENV_MODULE_INST_OFFSET
+  //   l32i  base, base, XUANSI_LITERAL_BASE_SLOT
+  //
+  // where a2 is the first argument of every WAMR AOT function (the
+  // exec_env pointer).  The first hop reads exec_env->module_inst (the
+  // same offset wamrc itself bakes into aot_inst loads); the second hop
+  // reads a dedicated pointer field in the module instance structure
+  // that the WAMR-side loader fills with the address of the loaded
+  // literal pool.  Constants are then read as [base + static offset]
+  // with the offset fixed at object-emission time, so the pool can live
+  // in a non-executable mapping and no l32r is emitted at all.
+  //
+  // XUANSI_LITERAL_BASE_SLOT is the byte offset of that field inside the
+  // module instance structure.  The WAMR fork defines the field at the
+  // same byte offset; the two constants must stay in sync (single
+  // source of truth is this pair of names, mirrored by name on the WAMR
+  // side).
+  static constexpr unsigned XUANSI_EXEC_ENV_MODULE_INST_OFFSET = 8;
+  static constexpr unsigned XUANSI_LITERAL_BASE_SLOT = 64;
+
+  bool useLiteralPoolBase() const;
+
+
   bool hasDensity() const { return HasDensity; }
 
   bool hasSingleFloat() const { return HasSingleFloat; }

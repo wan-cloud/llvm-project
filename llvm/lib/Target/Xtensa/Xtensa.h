@@ -32,5 +32,8 @@ FunctionPass *createXtensaFixupHwLoops();
 FunctionPass *createXtensaPSRAMCacheFixPass();
 FunctionPass *createXtensaConstantIslandPass();
 FunctionPass *createXtensaBRegFixupPass();
+// xuansi A3 surgery: rewrite l32r pool loads through the literal base
+// register (see XUANSI_LITERAL_BASE_SLOT in XtensaSubtarget.h).
+FunctionPass *createXtensaLiteralPoolPass();
 } // namespace llvm
 #endif /* LLVM_LIB_TARGET_XTENSA_XTENSA_H */

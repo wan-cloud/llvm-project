@@ -308,6 +308,20 @@ def L32R : RI16_Inst<0x01, (outs AR:$t), (ins L32Rtarget:$label),
 //pcrel addr loading using L32R
 def : Pat<(Xtensa_pcrel_wrapper tconstpool:$in), (L32R tconstpool:$in)>;
 
+// xuansi A3 surgery pseudos: pool loads addressed through the literal
+// base register.  Created by the XtensaLiteralPool pass (never matched
+// out of a DAG pattern); expanded by XtensaAsmPrinter once the module
+// pool layout assigns the final byte offset.  LPOOL_BASE materialises
+// the pool base from the exec_env/module instance chain, LPOOL_L32
+// loads one pool word at a static offset from the base register.
+let isPseudo = 1, mayLoad = 1 in {
+def LPOOL_BASE : Pseudo<(outs AR:$t), (ins),
+                        "!xuansi literal pool base!", []>;
+def LPOOL_L32 : Pseudo<(outs AR:$t), (ins AR:$base, i32imm:$pooloff),
+                       "!xuansi literal pool load!", []>;
+}
+
+
 // FrameIndexes are legalized when they are operands from load/store
 // instructions. The same not happens for stack address copies, so an
 // add op with mem ComplexPattern is used and the stack address copy

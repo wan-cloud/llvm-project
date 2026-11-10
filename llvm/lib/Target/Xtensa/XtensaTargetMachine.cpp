@@ -137,6 +137,9 @@ void XtensaPassConfig::addIRPasses() {
 
 void XtensaPassConfig::addPreRegAlloc() {
   addPass(createXtensaHardwareLoops());
+  // xuansi A3 surgery: rewrite ISel-produced l32r pool loads before
+  // register allocation so the pool base can live in a virtual register.
+  addPass(createXtensaLiteralPoolPass());
 }
 
 void XtensaPassConfig::addPreEmitPass() {
