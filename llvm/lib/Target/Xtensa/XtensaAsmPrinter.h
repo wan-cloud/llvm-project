@@ -16,6 +16,7 @@
 #define LLVM_LIB_TARGET_XTENSA_XTENSAASMPRINTER_H
 
 #include "XtensaTargetMachine.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/CodeGen/AsmPrinter.h"
 #include "llvm/CodeGen/MachineConstantPool.h"
 #include "llvm/Support/Compiler.h"
@@ -32,6 +33,20 @@ class LLVM_LIBRARY_VISIBILITY XtensaAsmPrinter : public AsmPrinter {
   /// InConstantPool - Maintain state when emitting a sequence of constant
   /// pool entries so we can properly mark them as data regions.
   bool InConstantPool = false;
+  // ------------------------------------------------------------------
+  // xuansi A3 surgery: module-wide literal pool bookkeeping.  The pool
+  // is emitted per function into one shared .literal section (functions
+  // in module order); CurPoolStart/CurPoolOffsets locate this function's
+  // slice so LPOOL_L32 expansion can bake final offsets into l32i/addmi.
+  /// Byte offset of this function's pool slice within the module pool.
+  unsigned CurPoolStart = 0;
+  /// Total pool bytes emitted by all previous functions.
+  unsigned ModulePoolBytes = 0;
+  /// Byte offset of each constant pool entry within this function's slice.
+  DenseMap<unsigned, unsigned> CurPoolOffsets;
+  void emitPoolLoad(unsigned Dst, unsigned Base, unsigned Offset);
+  void emitLiteralBaseChain(unsigned Dst);
+
 public:
   explicit XtensaAsmPrinter(TargetMachine &TM,
                             std::unique_ptr<MCStreamer> Streamer)

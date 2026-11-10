@@ -20,6 +20,7 @@
 #include "XtensaSubtarget.h"
 #include "TargetInfo/XtensaTargetInfo.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/CodeGen/MachineModuleInfoImpls.h"
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
@@ -49,11 +50,55 @@ void XtensaAsmPrinter::emitInstruction(const MachineInstr *MI) {
   MCInst LoweredMI;
   unsigned Opc = MI->getOpcode();
   const MachineConstantPool *MCP = MF->getConstantPool();
+  const XtensaSubtarget *Subtarget = &MF->getSubtarget<XtensaSubtarget>();
 
   // If we just ended a constant pool, mark it as such.
   if (InConstantPool && Opc != Xtensa::CONSTPOOL_ENTRY) {
     OutStreamer->emitDataRegion(MCDR_DataRegionEnd);
     InConstantPool = false;
+  }
+
+  // xuansi A3 surgery: expand the pool-base pseudos once the module pool
+  // layout has fixed the byte offsets (see emitConstantPool).
+  if (Subtarget->useLiteralPoolBase()) {
+    if (Opc == Xtensa::LPOOL_BASE) {
+      emitLiteralBaseChain(MI->getOperand(0).getReg());
+      return;
+    }
+    if (Opc == Xtensa::LPOOL_L32) {
+      const MachineOperand &CP = MI->getOperand(2);
+      assert(CP.isCPI() && "LPOOL_L32 without a constant pool index");
+      auto It = CurPoolOffsets.find(CP.getIndex());
+      if (It == CurPoolOffsets.end())
+        report_fatal_error("LPOOL_L32 references a constant pool entry "
+                           "outside this function's pool: " +
+                           MF->getName());
+      // The pool offset operand can carry a positive addend (index into a
+      // wider pool entry); CP offsets are negative in LLVM convention, so
+      // negate before folding in.
+      int64_t Addend = CP.getOffset();
+      uint64_t Off = CurPoolStart + It->second;
+      if (Addend > 0)
+        Off += Addend;
+      else if (Addend < 0)
+        report_fatal_error("negative constant pool addend in " + MF->getName());
+      if (Off > 32512 + 252)
+        report_fatal_error("xuansi literal pool offset " + Twine(Off) +
+                           " out of addmi/l32i range in " + MF->getName());
+      emitPoolLoad(MI->getOperand(0).getReg(), MI->getOperand(1).getReg(),
+                   (unsigned)Off);
+      return;
+    }
+    // Guard: with the literal base mode on, no l32r-to-pool may survive
+    // to emission.  l32r pool loads created after register allocation
+    // (bool-mask fixups, large frame prologues, far-branch relaxation)
+    // land here: refuse loudly rather than emit an l32r behind the
+    // non-executable pool.
+    if (Opc == Xtensa::L32R && MI->getOperand(1).isCPI())
+      report_fatal_error("l32r pool load survived the xuansi literal-base "
+                         "rewrite in " +
+                         MF->getName() +
+                         " (post-RA creator; needs base-register expansion)");
   }
 
   if (Opc == Xtensa::CONSTPOOL_ENTRY) {
@@ -93,6 +138,49 @@ void XtensaAsmPrinter::emitInstruction(const MachineInstr *MI) {
   }
   Lower.lower(MI, LoweredMI);
   EmitToStreamer(*OutStreamer, LoweredMI);
+}
+
+// xuansi A3 surgery helpers: expand the pool pseudos into real l32i/addmi
+// MC instructions with baked byte offsets.
+
+/// Materialise the literal pool base: a2 is the exec_env pointer (first
+/// argument of every WAMR AOT function); load module_inst, then the pool
+/// base from its dedicated slot.
+void XtensaAsmPrinter::emitLiteralBaseChain(unsigned Dst) {
+  EmitToStreamer(*OutStreamer,
+                 MCInstBuilder(Xtensa::L32I)
+                     .addReg(Dst)
+                     .addReg(Xtensa::A2)
+                     .addImm(XtensaSubtarget::XUANSI_EXEC_ENV_MODULE_INST_OFFSET));
+  EmitToStreamer(*OutStreamer,
+                 MCInstBuilder(Xtensa::L32I)
+                     .addReg(Dst)
+                     .addReg(Dst)
+                     .addImm(XtensaSubtarget::XUANSI_LITERAL_BASE_SLOT));
+}
+
+/// Load one pool word at byte offset Off from the base register.  The
+/// l32i immediate addresses bytes 0..1020; larger offsets use addmi
+/// (imm8 << 8, so 256-aligned) plus a low-byte l32i.  Dst doubles as the
+/// addmi scratch so no extra register is needed.
+void XtensaAsmPrinter::emitPoolLoad(unsigned Dst, unsigned Base,
+                                    unsigned Off) {
+  if (Off <= 1020) {
+    EmitToStreamer(*OutStreamer, MCInstBuilder(Xtensa::L32I)
+                                     .addReg(Dst)
+                                     .addReg(Base)
+                                     .addImm(Off));
+    return;
+  }
+  assert((Off & 3) == 0 && Off <= 32512 + 252 && "offset range checked by caller");
+  EmitToStreamer(*OutStreamer, MCInstBuilder(Xtensa::ADDMI)
+                                   .addReg(Dst)
+                                   .addReg(Base)
+                                   .addImm(Off & ~0xFFu));
+  EmitToStreamer(*OutStreamer, MCInstBuilder(Xtensa::L32I)
+                                   .addReg(Dst)
+                                   .addReg(Dst)
+                                   .addImm(Off & 0xFFu));
 }
 
 void XtensaAsmPrinter::emitMachineConstantPoolEntry(
@@ -151,6 +239,23 @@ void XtensaAsmPrinter::emitConstantPool() {
   if (CP.empty())
     return;
 
+  if (Subtarget->useLiteralPoolBase()) {
+    // xuansi A3 surgery: record this function's slice of the module pool
+    // before emitting it.  Entries are emitted in index order, each one
+    // 4-byte aligned, exactly as the loop below does, so the running
+    // offset of entry i is the sum of align4(size_j) for j < i.
+    // LPOOL_L32 expansion during the function body reads this back.
+    CurPoolOffsets.clear();
+    CurPoolStart = ModulePoolBytes;
+    unsigned Running = 0;
+    for (unsigned i = 0, e = CP.size(); i != e; ++i) {
+      Running = (Running + 3u) & ~3u;
+      CurPoolOffsets[i] = Running;
+      Running += CP[i].getSizeInBytes(getDataLayout());
+    }
+    ModulePoolBytes += Running;
+  }
+
   for (unsigned i = 0, e = CP.size(); i != e; ++i) {
     const MachineConstantPoolEntry &CPE = CP[i];
 
@@ -182,6 +287,14 @@ void XtensaAsmPrinter::emitConstantPool() {
                                                    ELF::SHF_ALLOC);
         S->setAlignment(Align(4));
         OutStreamer->switchSection(S);
+        if (Subtarget->useLiteralPoolBase() && SectionName != ".literal") {
+          // The literal-base mode bakes offsets against one module-wide
+          // pool; function-specific pool sections (text hot/cold
+          // splitting) would each restart at offset zero.
+          report_fatal_error("xuansi-literal-base requires a single pool "
+                             "section, got: " +
+                             Twine(SectionName));
+        }
       }
     }
 
