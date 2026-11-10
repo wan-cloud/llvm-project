@@ -315,10 +315,18 @@ def : Pat<(Xtensa_pcrel_wrapper tconstpool:$in), (L32R tconstpool:$in)>;
 // the pool base from the exec_env/module instance chain, LPOOL_L32
 // loads one pool word at a static offset from the base register.
 let isPseudo = 1, mayLoad = 1 in {
+// Size = the worst-case expansion (addmi + l32i = 6 bytes): branch
+// relaxation budgeting must not under-count the final expansion size,
+// or conditional branches slip out of their fixup range (seen on
+// st7789).  Over-estimating is always safe: real deltas only shrink.
 def LPOOL_BASE : Pseudo<(outs AR:$t), (ins),
-                        "!xuansi literal pool base!", []>;
+                        "!xuansi literal pool base!", []> {
+  let Size = 6;
+}
 def LPOOL_L32 : Pseudo<(outs AR:$t), (ins AR:$base, i32imm:$pooloff),
-                       "!xuansi literal pool load!", []>;
+                       "!xuansi literal pool load!", []> {
+  let Size = 6;
+}
 }
 
 
