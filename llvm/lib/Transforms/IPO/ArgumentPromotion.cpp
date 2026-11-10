@@ -762,6 +762,27 @@ static Function *promoteArguments(Function *F, FunctionAnalysisManager &FAM,
   DenseMap<Argument *, SmallVector<OffsetAndArgPart, 4>> ArgsToPromote;
   unsigned NumArgsAfterPromote = F->getFunctionType()->getNumParams();
   for (Argument *PtrArg : PointerArgs) {
+    // xuansi A3 surgery: never promote the first argument of a WAMR AOT
+    // wrapped body.  wamrc compiles every wasm function with the native
+    // stack-overflow precheck as a pair: an exported precheck wrapper and
+    // a wrapped body marked internal + noinline + "short-call" (xtensa),
+    // the body having exactly one caller, the wrapper, which forwards its
+    // own first argument -- the exec_env pointer -- verbatim.  The body's
+    // machine code derives the literal pool base from the first argument
+    // register (LPOOL_BASE reads a2; XtensaLiteralPool.cpp expands it to
+    // l32i/l32i through exec_env -> module_inst), so promoting that
+    // argument would replace it with a caller-loaded derived value (the
+    // module instance, then the memory base) in both the call and the
+    // body, and the baked pool-base chain would read its offsets off the
+    // promoted value and fault at runtime.  Keep arg0 = exec_env: the
+    // body then derives everything from it itself, exactly like the
+    // stock l32r codegen, where promotion of this pair is what makes the
+    // wrapper pass the memory base today.  "short-call" is only ever
+    // attached by wamrc to xtensa wrapped bodies, so every other
+    // promotion decision (other arguments included) is untouched.
+    if (PtrArg->getArgNo() == 0 && F->hasFnAttribute("short-call"))
+      continue;
+
     // Replace sret attribute with noalias. This reduces register pressure by
     // avoiding a register copy.
     if (PtrArg->hasStructRetAttr()) {
