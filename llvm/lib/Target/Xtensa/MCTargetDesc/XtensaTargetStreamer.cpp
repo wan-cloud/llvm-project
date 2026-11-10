@@ -56,8 +56,11 @@ void XtensaTargetELFStreamer::emitLiteralLabel(MCSymbol *LblSym, SMLoc L) {
     }
   }
 
-  MCSection *ConstSection = Context.getELFSection(
-      SectionName, ELF::SHT_PROGBITS, ELF::SHF_EXECINSTR | ELF::SHF_ALLOC);
+  // xuansi surgery: the literal pool is pure data, keep it out of the
+  // executable segment (SHF_ALLOC without SHF_EXECINSTR).
+  MCSection *ConstSection = Context.getELFSection(SectionName,
+                                                  ELF::SHT_PROGBITS,
+                                                  ELF::SHF_ALLOC);
   ConstSection->setAlignment(Align(4));
 
   OutStreamer.pushSection();
@@ -95,8 +98,11 @@ void XtensaTargetELFStreamer::emitLiteral(const MCExpr *Value, SMLoc L) {
     }
   }
 
-  MCSection *ConstSection = Context.getELFSection(
-      SectionName, ELF::SHT_PROGBITS, ELF::SHF_EXECINSTR | ELF::SHF_ALLOC);
+  // xuansi surgery: the literal pool is pure data, keep it out of the
+  // executable segment (SHF_ALLOC without SHF_EXECINSTR).
+  MCSection *ConstSection = Context.getELFSection(SectionName,
+                                                  ELF::SHT_PROGBITS,
+                                                  ELF::SHF_ALLOC);
 
   OutStreamer.pushSection();
   OutStreamer.switchSection(ConstSection);

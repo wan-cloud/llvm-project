@@ -177,9 +177,9 @@ void XtensaAsmPrinter::emitConstantPool() {
           SectionName += ".literal";
         }
 
-        MCSectionELF *S =
-            OutContext.getELFSection(SectionName, ELF::SHT_PROGBITS,
-                                     ELF::SHF_EXECINSTR | ELF::SHF_ALLOC);
+        MCSectionELF *S = OutContext.getELFSection(SectionName,
+                                                   ELF::SHT_PROGBITS,
+                                                   ELF::SHF_ALLOC);
         S->setAlignment(Align(4));
         OutStreamer->switchSection(S);
       }
