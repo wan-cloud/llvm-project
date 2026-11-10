@@ -183,9 +183,21 @@ public:
   // module instance structure.  The WAMR fork defines the field at the
   // same byte offset; the two constants must stay in sync (single
   // source of truth is this pair of names, mirrored by name on the WAMR
-  // side).
+  // side; a CI gate cross-asserts the two definitions).
+  //
+  // Slot placement (P3-T10 layout audit): the instance struct is layout
+  // normalized between the 64-bit wamrc build and the 32-bit target
+  // build (WAMR's DefPointer pads every pointer to 8 bytes), and stock
+  // AOT containers BAKE several offsets into generated code
+  // (cur_exception at 104, global_table_data at 344).  Inserting a new
+  // field anywhere in 0..344 would shift those offsets and silently
+  // break every existing stock container.  The slot is therefore carved
+  // from the upstream reserved[] tail instead (first 8 of its 28
+  // bytes): the dedicated field lands at 320, no existing field moves,
+  // and global_table_data stays at 344.  316 fits a single l32i (imm8<<2
+  // reaches 1020), so the base chain stays two instructions.
   static constexpr unsigned XUANSI_EXEC_ENV_MODULE_INST_OFFSET = 8;
-  static constexpr unsigned XUANSI_LITERAL_BASE_SLOT = 64;
+  static constexpr unsigned XUANSI_LITERAL_BASE_SLOT = 320;
 
   bool useLiteralPoolBase() const;
 
